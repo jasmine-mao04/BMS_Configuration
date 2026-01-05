@@ -55,6 +55,8 @@ static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
 #define I2C_ADDR 0x10 // 7 bit addr is 0x08, 8 bit addr is 0x10(write) or 0x11(read). HAL functions take 8 bit addr as arg so 0x10
+uint8_t test;
+uint8_t cellType; // cellType: 0 if 35E cells, else 50s cells
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -87,7 +89,9 @@ HAL_StatusTypeDef I2C_Read(uint16_t device_addr, uint8_t reg_addr, uint8_t * rDa
 	while (HAL_I2C_Master_Transmit(&hi2c1, device_addr, pData, 1, 100) != HAL_OK) { // dev_addr + W, reg_addr
 		HAL_Delay(1); // commands take <= 1 ms to complete
 	}
-	return HAL_I2C_Master_Receive(&hi2c1, device_addr, rData, length, 100); // dev_addr + R, rData(TX from slave)
+	HAL_StatusTypeDef status = HAL_I2C_Master_Receive(&hi2c1, device_addr, rData, length, 100); // dev_addr + R, rData(TX from slave)
+
+	return status;
 }
 
 HAL_StatusTypeDef I2C_Write(uint16_t device_addr, uint8_t reg_addr, uint8_t * block, uint16_t length) {
@@ -151,8 +155,9 @@ sequence:
 
 * Write RAM addr to 0x3E and Checksum+length to 0x60
 * total data length includes:
- *  2 bytes: 0x3E and 0x3F
- *  2 bytes: 0x60 and 0x61
+ *  2 bytes command: 0x3E and 0x3F
+ *  2 bytes checksum and length: 0x60 and 0x61
+ *  1 byte wData: 0x40(transfer buffer)
  *  max 32 bytes: length of the transfer buffer
  *  if the entire 32-byte transfer buffer is used, the data length will be 0x24 = 32 + 4
 */
@@ -189,13 +194,14 @@ HAL_StatusTypeDef CfgRegulators(void) {
 	HAL_StatusTypeDef Reg0Status = DataRAM_Write(0x9237, Reg0Data, 1);
 	HAL_StatusTypeDef Reg12Status = DataRAM_Write(0x9236, Reg12Data, 1);
 
+
 	return (Reg0Status == HAL_OK && Reg12Status == HAL_OK) ? HAL_OK : HAL_ERROR;
 }
 
 HAL_StatusTypeDef CfgAlertPin(void) {
-	/*
-	 * Configures ALERT Pin function to Alert, and to drive active high using REG18
-	 */
+/*
+ * Configures ALERT Pin function to Alert, and to drive active high using REG18
+ */
 	uint8_t AlertPinCfgData[1] = {0x0A};
 	return DataRAM_Write(0x92FC, AlertPinCfgData, 1);
 }
@@ -211,15 +217,24 @@ HAL_StatusTypeDef CfgVcellMode(void) {
 	return DataRAM_Write(0x9304, NumCellsData, 2);
 }
 
-HAL_StatusTypeDef CfgPrimaryProtections(void) {
+HAL_StatusTypeDef CfgUserUnits(void) {
 /*
- * PrimaryProtectionsData: 8 bits that enable/disable primary protections
- * Goal: Enable the primary protections(COV, CUV, OCC, SCD, OCD1, OCD2) to control FETs, and enable FET charge pumps
+ * Set voltage units to mV: bit [2] = 0
+ * Set current units to mA: bits [1:0] = 1
  */
-	uint8_t PrimaryProtectionsData[1] = {0b11111100};
+	uint8_t UserUnitsData[1] = {0x01};
+	return DataRAM_Write(0x9303, UserUnitsData, 2);
+}
+
+HAL_StatusTypeDef CfgPrimaryProtections(uint8_t PrimaryProtectionsData) {
+/*
+ * PrimaryProtectionsData: 8 bit register Enabled Protections A that enable/disable primary protections
+ * Goal: Enable the primary protections(COV, CUV, OCC, SCD, OCD1, OCD2) to control FETs, and enable FET charge pumps
+ * COV:[3], CUV:[2], OCC:[4], SCD:[7], OCD1:[5], OCD2:[6]
+ */
 	HAL_StatusTypeDef EnabledProtectionsStatus = DataRAM_Write(0x9261, PrimaryProtectionsData, 1);
-	HAL_StatusTypeDef EnabledCHGFETStatus = DataRAM_Write(0x9265, PrimaryProtectionsData, 1);
-	HAL_StatusTypeDef EnabledDSGFETStatus = DataRAM_Write(0x9269, PrimaryProtectionsData, 1);
+	HAL_StatusTypeDef EnabledCHGFETStatus = DataRAM_Write(0x9265, PrimaryProtectionsData, 1); // COV, OCC, SCD
+	HAL_StatusTypeDef EnabledDSGFETStatus = DataRAM_Write(0x9269, PrimaryProtectionsData, 1); // CUV, OCD1, OCD2, SCD
 
 	return (EnabledProtectionsStatus == HAL_OK && EnabledCHGFETStatus == HAL_OK && EnabledDSGFETStatus == HAL_OK) ? HAL_OK : HAL_ERROR;
 }
@@ -240,10 +255,10 @@ HAL_StatusTypeDef CfgAlarmMask(void) {
 	return (DefaultAlarmMaskStatus == HAL_OK && SFAlertMaskAStatus == HAL_OK && SFAlertMaskBStatus == HAL_OK && SFAlertMaskCStatus == HAL_OK) ? HAL_OK : HAL_ERROR;
 }
 
-HAL_StatusTypeDef CfgFETOptions(int test) {
-	/*
-	 * Sets FET Options register to enable PDSG FETs, device FET control, and optionally host FET control if test=True
-	 */
+HAL_StatusTypeDef CfgFETOptions(int test=0) {
+/*
+ * Sets FET Options register to enable PDSG FETs, device FET control, and optionally host FET control if test=True
+ */
 	uint8_t FETOptionsData[1];
 	FETOptionsData[0] = (test == 1) ? 0x1C : 0x18; // if testing, bit [2] HOST_FET_EN is set to allow host commands to control FETs
 
@@ -266,10 +281,6 @@ HAL_StatusTypeDef CfgMfgStatusInit(void) {
 
 
 ////////////////////////////	13.6 Protections	////////////////////////////
-/*
- * cellType: 0 if 35E cells, else 50s cells
- */
-
 HAL_StatusTypeDef SetPrimaryCUV(uint8_t cellType) {
 	uint8_t threshold[1] = { (cellType == 0) ? 0x53 : 0x53 };
 	return DataRAM_Write(0x9275, threshold, 1);
@@ -304,41 +315,43 @@ HAL_StatusTypeDef SetPrimarySCD(uint8_t cellType) {
 
 HAL_StatusTypeDef EnterConfigUpdateMode(void) {
 	uint8_t wholeBlock[2] = {0x90, 0x00};
-	return I2C_Write(I2C_ADDR, 0x3E, wholeBlock, 2);
+	HAL_StatusTypeDef status I2C_Write(I2C_ADDR, 0x3E, wholeBlock, 2);
+	HAL_Delay(3); // cmd 0x0090 takes approx 2 ms
+	return status;
 }
 
 HAL_StatusTypeDef ExitConfigUpdateMode(void) {
 	uint8_t wholeBlock[2] = {0x92, 0x00};
+	HAL_StatusTypeDef status = I2C_Write(I2C_ADDR, 0x3E, wholeBlock, 2);
+	HAL_Delay(2); // cmd 0x0092 takes approx 1 ms
+	return status;
+}
+
+HAL_StatusTypeDef AllFETsON(void) {
+/*
+ * 0x0096 ALL_FETS_ON(): Allows all FETs to be enabled if nothing else is blocking them
+ */
+	uint8_t wholeBlock[2] = {0x96, 0x00};
 	return I2C_Write(I2C_ADDR, 0x3E, wholeBlock, 2);
 }
 
-HAL_StatusTypeDef AllFETsControl(int enableFETs) {
-	uint8_t ALL_FETS_OFF[2] = {0x95, 0x00}; // disable all FET drivers
-	uint8_t ALL_FETS_ON[2] = {0x96, 0x00}; // allow all FETs to be on if all safety conditions met
-	HAL_StatusTypeDef AllFETsStatus;
-
-	if (enableFETs == 1) AllFETsStatus = I2C_Write(I2C_ADDR, 0x3E, ALL_FETS_ON, 2);
-	else AllFETsStatus = I2C_Write(I2C_ADDR, 0x3E, ALL_FETS_OFF, 2);
-
-	return AllFETsStatus;
+HAL_StatusTypeDef AllFETsOFF(void) {
+/*
+ * 0x0095 ALL_FETS_OFF(): disables all FETs
+ */
+	uint8_t wholeBlock[2] = {0x95, 0x00};
+	return I2C_Write(I2C_ADDR, 0x3E, wholeBlock, 2);
 }
 
 
 HAL_StatusTypeDef FETStatusCmd(uint8_t * rData) {
-	/*
-	 * FET Status() read only command: monitor ALERT pin, CHG FET status, and DSG FET status
-	 * bit [6]: ALERT_PIN
-	 * bit [2]: DSG_FET -> 0 if off, 1 if on.
-	 * bit [1]: CHG_FET -> 0 if off, 1 if on.
-	 */
-	uint8_t AlarmStatusData[1];
+/*
+ * FET Status() 0x7f read only command: check if CHG and DSG FETs are on or off
+ * bit [0]: 1 if CHG FET on, 0 if off
+ * bit [2]: 1 if DSG FET on, 0 if off
+ */
 
-	HAL_StatusTypeDef AlarmStatus = I2C_Read(I2C_ADDR, 0x62, AlarmStatusData, 1);
-	HAL_StatusTypeDef FETStatusCmdStatus = I2C_Read(I2C_ADDR, 0x7F, rData, 1);
-
-	if (* AlarmStatusData != 0) I2C_Write(I2C_ADDR, 0x62, AlarmStatusData, 1); // if Alarm Status latch is set, clear all bits
-
-	return (AlarmStatus == HAL_OK && FETStatusCmdStatus == HAL_OK) ? HAL_OK : HAL_ERROR;
+	return I2C_Read(I2C_ADDR, 0x7F, rData, 1);
 }
 
 HAL_StatusTypeDef CellVoltageCmd(uint8_t cell, uint8_t * CellVoltage) {
@@ -352,13 +365,149 @@ HAL_StatusTypeDef CellVoltageCmd(uint8_t cell, uint8_t * CellVoltage) {
  */
 	uint8_t cmd_addr = 0x12 + (cell * 2);
 
-
-	return I2C_Read(I2C_ADDR, cmd_addr, CellVoltage, 2); // returns 16 bit mV in little endian bytes
+	return I2C_Read(I2C_ADDR, cmd_addr, CellVoltage, 2); // returns 16 bit(2 byte) mV in little endian
 }
 
-// commands to turn FETs on and off
+HAL_StatusTypeDef AllCellVoltageCmd(uint16_t * AllCellVoltages) {
+/*
+ * Read and display voltage of all enabled cells: 1, 2, 3, 4, 5, 10
+ */
+	char buffer[100];
 
+	I2C_Read(I2C_ADDR, 0x14, (uint8_t *)&AllCellVoltages[0], 2);
+	I2C_Read(I2C_ADDR, 0x16, (uint8_t *)&AllCellVoltages[1], 2);
+	I2C_Read(I2C_ADDR, 0x18, (uint8_t *)&AllCellVoltages[2], 2);
+	I2C_Read(I2C_ADDR, 0x1A, (uint8_t *)&AllCellVoltages[3], 2);
+	I2C_Read(I2C_ADDR, 0x1C, (uint8_t *)&AllCellVoltages[4], 2);
+	I2C_Read(I2C_ADDR, 0x26, (uint8_t *)&AllCellVoltages[5], 2);
 
+	sprintf(buffer, "Cell 1: %u mV, Cell 2: %u mV, Cell 3: %u mV\n", AllCellVoltages[0], AllCellVoltages[1], AllCellVoltages[2]);
+	HAL_UART_Transmit(&huart2, buffer, strlen(buffer), 100);
+
+	sprintf(buffer, "Cell 4: %u mV, Cell 5: %u mV, Cell 10: %u mV\n", AllCellVoltages[3], AllCellVoltages[4], AllCellVoltages[5]);
+	HAL_UART_Transmit(&huart2, buffer, strlen(buffer), 100);
+}
+
+HAL_StatusTypeDef CC2CurrentCmd(uint8_t * CC2Current) {
+	uint8_t cmd_addr = 0x3A;
+	char buffer[50];
+
+	return I2C_Read(I2C_ADDR, cmd_addr, CC2Current, 2); // returns 16 bit(2 byte) mV in little endian
+}
+
+HAL_StatusTypeDef test1(void) {
+/*
+ * Test 1: configure VCell Mode, regulators, user units.
+ * ensure correct voltage at regulator pins.
+*/
+	uint8_t * rData;
+	char buffer[100];
+
+	HAL_StatusTypeDef status = EnterConfigUpdateMode();
+	CfgVcellMode(); // enables cells 1-5 and 10
+	CfgRegulators(); // configures REG1 to 3.3 V and REG18 to 1.8 V
+	CfgUserUnits(); // sets user-volts to mV and user-amps to mA
+	ExitConfigUpdateMode();
+
+	DataRAM_Read(0x9304, rData, 2); // vcell mode
+	sprintf(buffer, "RAM read data at 0x9304: %u \n", *(uint16_t *)rData);
+	HAL_UART_Transmit(&huart2, buffer, strlen(buffer), 100);
+
+	DataRAM_Read(0x9236, rData, 1); // reg12
+	sprintf(buffer, "RAM read data at 0x9236: %u \n", *rData);
+	HAL_UART_Transmit(&huart2, buffer, strlen(buffer), 100);
+
+	DataRAM_Read(0x9237, rData, 1); // reg0
+	sprintf(buffer, "RAM read data at 0x9237: %u \n", *rData);
+	HAL_UART_Transmit(&huart2, buffer, strlen(buffer), 100);
+
+	DataRAM_Read(0x9303, rData, 1); // user units
+	sprintf(buffer, "RAM read data at 0x9303: %u \n", *rData);
+	HAL_UART_Transmit(&huart2, buffer, strlen(buffer), 100);
+
+	return status;
+}
+
+HAL_StatusTypeDef test2(void) {
+/*
+* Test 2: Verify that IC can read voltage of each cell
+*/
+	uint8_t * CellVoltage;
+	char buffer[100];
+	int cell = 1; // repeat for cell = 1, 2, 3, 4, 5, 10
+
+	HAL_StatusTypeDef status = EnterConfigUpdateMode();
+	CfgVcellMode();
+	CfgRegulators();
+	CfgUserUnits();
+	ExitConfigUpdateMode();
+
+	CellVoltageCmd(cell, CellVoltage);
+	sprintf(buffer, "Voltage of cell %u: %u mV\n", cell, *(uint16_t *)CellVoltage);
+
+	return status;
+}
+
+HAL_StatusTypeDef test3(void) {
+/*
+* Test 3: Verify that IC can read pack current
+*/
+	uint8_t * CC2Current;
+	char buffer[100];
+
+	HAL_StatusTypeDef status = EnterConfigUpdateMode();
+	CfgVcellMode();
+	CfgRegulators();
+	CfgUserUnits();
+	ExitConfigUpdateMode();
+
+	CC2CurrentCmd(CC2Current);
+	sprintf(buffer, "Pack current: %u mA\n", *(uint16_t *)CC2Current);
+
+	return status;
+}
+
+HAL_StatusTypeDef test4(void) {
+/*
+ * Test 4: Configure COV threshold and ensure that OV turns CHG FETs off
+ * Poll CHG FET status while increasing voltage applied at cell terminals
+ * Ensure that CHG FETs turn off once applied voltage reaches COV threshold
+ */
+	test = 4;
+	//uint8_t * CellVoltage;
+	char buffer[100];
+	//int cell = 1; // repeat for cell = 1, 2, 3, 4, 5, 10
+
+	HAL_StatusTypeDef status = EnterConfigUpdateMode();
+	CfgVcellMode();
+	CfgRegulators();
+	CfgUserUnits();
+
+	CfgPrimaryProtections(0b00001000); // enable COV = primary protection A[3]
+
+	CfgFETOptions(); // configure FETs
+	CfgFETChgPump();
+	CfgMfgStatusInit();
+
+	SetPrimaryCOV(cellType); // set COV threshold value
+
+	AllFETsON();
+
+	ExitConfigUpdateMode();
+
+	//CellVoltageCmd(cell, CellVoltage);
+	//sprintf(buffer, "Voltage of cell %u: %u mV\n", cell, *(uint16_t *)CellVoltage);
+	//FETStatusCmd(uint8_t * rData) // bit[0] is CHG FET status
+
+	HAL_StatusTypeDef CellVoltageCmd
+
+	return status;
+
+}
+
+void test5(void) {
+
+}
 
 /* USER CODE END 0 */
 
@@ -394,9 +543,9 @@ int main(void)
   MX_USART2_UART_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
-  uint8_t voltage[2];
-  HAL_StatusTypeDef voltage_status = CellVoltageCmd(1, voltage);
-
+  test1();
+  test2();
+  test3();
   /* USER CODE END 2 */
 
   /* Infinite loop */
